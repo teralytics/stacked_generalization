@@ -8,8 +8,10 @@ from sklearn.metrics import mean_squared_error
 from collections import OrderedDict
 from sklearn.preprocessing import LabelBinarizer
 from sklearn.externals import joblib
-import util
 import os
+from sklearn.base import clone, ClassifierMixin
+from stacked_generalization.lib import util
+from itertools import product, groupby
 
 
 class BaseStacked(BaseEstimator):
@@ -72,7 +74,7 @@ class BaseStacked(BaseEstimator):
 
                 if blend_train_j is None:
                     blend_train_j = self._get_blend_init(y_train, now_learner)
-                blend_train_j[cv_index] = self._get_child_predict(now_learner, xs_cv, cv_index)
+                blend_train_j[cv_index] = self._get_child_predict(now_learner, xs_cv, self.stack_by_proba, self.save_stage0, cv_index)
             blend_train = numpy_c_concatenate(blend_train, blend_train_j)
         return blend_train, blend_test
 
@@ -137,7 +139,7 @@ class BaseStacked(BaseEstimator):
         for clfs in self.all_learner.values():
             blend_test_j = None
             for clf in clfs:
-                blend_test_j_temp = self._get_child_predict(clf, xs_test, index)
+                blend_test_j_temp = self._get_child_predict(clf, xs_test, self.stack_by_proba, self.save_stage0, index)
                 if blend_test_j is None:
                     blend_test_j = blend_test_j_temp
                 else:
@@ -146,9 +148,10 @@ class BaseStacked(BaseEstimator):
             blend_test = numpy_c_concatenate(blend_test, blend_test_j)
         return blend_test
 
-    def _get_child_predict(self, clf, X, index=None):
-        if self.stack_by_proba and hasattr(clf, 'predict_proba'):
-            if self.save_stage0 and index is not None:
+    @staticmethod
+    def _get_child_predict(clf, X, stack_by_proba, save_stage0, index=None):
+        if stack_by_proba and hasattr(clf, 'predict_proba'):
+            if save_stage0 and index is not None:
                 proba = util.saving_predict_proba(clf, X, index)
             else:
                 proba = clf.predict_proba(X)
@@ -375,9 +378,10 @@ class StackedRegressor(BaseStacked, RegressorMixin):
             width = clf.n_components
         return np.zeros((y_train.size, width))
 
-    def _get_child_predict(self, clf, X, index=None):
+    @staticmethod
+    def _get_child_predict(clf, X, stack_by_proba, save_stage0, index=None):
         if hasattr(clf, 'predict'):
-            if self.save_stage0 and index is not None:
+            if save_stage0 and index is not None:
                 predict_result = util.saving_predict(clf, X, index)
             else:
                 predict_result = clf.predict(X)
@@ -456,3 +460,120 @@ class FWLSRegressor(StackedRegressor):
     def _pre_propcess(self, blend, X):
         X = multiple_feature_weight(blend, self.feature_func(X))
         return X
+
+
+class DistributedBaseStacked(BaseStacked):
+    """
+    Base class for distributed spark version.
+
+    Warning: This class should not be used directly. Use derived classes
+    instead.
+    """
+
+    def _fit_child(self, skf, xs_train, y_train):
+        """Build stage0 models from the training set (xs_train, y_train).
+        Parameters
+        ----------
+        skf: StratifiedKFold-like iterator
+            Use for cross validation blending.
+        xs_train : array-like or sparse matrix of shape = [n_samples, n_features]
+            The training input samples.
+        y_train : array-like, shape = [n_samples]
+            The target values (class labels in classification).
+        Returns
+        -------
+        blend_train : array-like, shape = [n_samples]
+            For stage1 model training.
+        blend_test : array-like, shape = [n_samples]
+            If you use TwoStageKFold, blended sample for test will be prepared.
+        """
+
+        def _fit_clf(j, i, clf, train_index, cv_index, xs_bc, y_bc, stack_by_proba):
+            all_learner_key = str(type(clf)) + str(j)
+            xs = xs_bc.value
+            y = y_bc.value
+
+            xs_now_train = xs[train_index]
+            y_now_train = y[train_index]
+            xs_cv = xs[cv_index]
+
+            clf.fit(xs_now_train, y_now_train)
+
+            blend_train_j_i = BaseStacked._get_child_predict(clf, xs_cv, stack_by_proba, False, cv_index)
+
+            return j, all_learner_key, i, cv_index, clf, blend_train_j_i
+
+        tasks = list(product(enumerate(self.clfs), enumerate(skf)))
+
+        tasks_rdd = self.sc.parallelize(tasks)
+
+        xs_train_bc = self.sc.broadcast(xs_train)
+        y_train_bc = self.sc.broadcast(y_train)
+
+        stack_by_proba = self.stack_by_proba
+        results = tasks_rdd.map(lambda tuple: _fit_clf(tuple[0][0], tuple[1][0], clone(tuple[0][1]), tuple[1][1][0], tuple[1][1][1], xs_train_bc, y_train_bc, stack_by_proba)).collect()
+
+        results = sorted(results, key=lambda x: (x[0], x[2]))
+
+        blend_train = None
+        blend_test = None
+
+        for (j, all_learner_key), cvs in groupby(results, lambda x: (x[0], x[1])):
+            blend_train_j = None
+            self.all_learner[all_learner_key] = []
+            for (_, _, i, cv_index, clf, blend_train_j_i) in cvs:
+                if blend_train_j is None:
+                    blend_train_j = self._get_blend_init(y_train, clf)
+                blend_train_j[cv_index] = blend_train_j_i
+                self.all_learner[all_learner_key].append(clf)
+
+            blend_train = util.numpy_c_concatenate(blend_train, blend_train_j)
+
+        return blend_train, blend_test
+
+
+class DistributedStackedRegressor(StackedRegressor, DistributedBaseStacked):
+    def __init__(self,
+                 sc,
+                 bclf,
+                 clfs,
+                 n_folds=3,
+                 oob_score_flag=False,
+                 oob_metrics=mean_squared_error,
+                 Kfold=None,
+                 verbose=0,
+                 save_dir=''):
+        self.sc = sc
+        super(DistributedStackedRegressor, self).__init__(bclf,
+                                                          clfs,
+                                                          n_folds,
+                                                          oob_score_flag,
+                                                          oob_metrics,
+                                                          Kfold,
+                                                          verbose,
+                                                          False,
+                                                          save_dir)
+
+class DistributedStackedClassifier(StackedClassifier, DistributedBaseStacked):
+    def __init__(self,
+                 sc,
+                 bclf,
+                 clfs,
+                 n_folds=3,
+                 stack_by_proba=True,
+                 oob_score_flag=False,
+                 oob_metrics=accuracy_score,
+                 Kfold=None,
+                 verbose=0,
+                 save_dir=''):
+        self.sc = sc
+
+        super(DistributedStackedClassifier, self).__init__(bclf,
+                                                           clfs,
+                                                          n_folds,
+                                                          stack_by_proba,
+                                                          oob_score_flag,
+                                                          oob_metrics,
+                                                          Kfold,
+                                                          verbose,
+                                                          save_dir)

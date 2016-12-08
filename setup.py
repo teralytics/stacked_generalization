@@ -9,6 +9,7 @@ install_requires = [
     'numpy',
     'scikit-learn',
     'pandas',
+    'findspark'
 ]
 
 

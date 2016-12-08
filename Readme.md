@@ -4,7 +4,7 @@
 Implemented machine learning ***stacking technic[1]*** as handy library in Python.
 Feature weighted linear stacking is also available. (See https://github.com/fukatani/stacked_generalization/tree/master/stacked_generalization/example)
 
-Including simple model cache system Joblibed claasifier and Joblibed Regressor.
+Including simple model cache system Joblibed classifier and Joblibed Regressor.
 
 ## Feature
 
@@ -103,17 +103,47 @@ score = clf.score(xs_test, y_test, test_idx)
 
 See also https://github.com/fukatani/stacked_generalization/blob/master/stacked_generalization/lib/joblibed.py
 
+## Running with Spark
+You can use the stacking interface transparently within your pyspark environment.
+Use DistributedStackedClassifier respectively DistributedStackedRegressor.
+
+The individual fitting of the estimators will be executed in parallel.
+
+
+```python
+from stacked_generalization.lib.stacking import DistributedStackedClassifier
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn import datasets, metrics
+iris = datasets.load_iris()
+
+# Stage 1 model
+bclf = LogisticRegression(random_state=1)
+
+# Stage 0 models
+clfs = [RandomForestClassifier(n_estimators=40, criterion = 'gini', random_state=1),
+        GradientBoostingClassifier(n_estimators=25, random_state=1),
+        RidgeClassifier(random_state=1)]
+
+# same interface as scikit-learn
+sl = DistributedStackedClassifier(sc, bclf, clfs)
+sl.fit(iris.target, iris.data)
+score = metrics.accuracy_score(iris.target, sl.predict(iris.data))
+print("Accuracy: %f" % score)
+```
+
 ## Software Requirement
 
 * Python (2.7 or 3.4)
 * numpy
 * scikit-learn
 * pandas
+* findspark
 
 ## Installation
 
 ```
-pip install stacked_generalization
+pip install git+https://github.com/teralytics/stacked_generalization
 ```
 
 ## License
